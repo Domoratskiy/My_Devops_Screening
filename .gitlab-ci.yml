@@ -1,0 +1,87 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  REGISTRY: registry.example.com
+  IMAGE_NAME: shop-api
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+
+test:
+  stage: test
+  image: node:20-alpine
+  script:
+    - npm ci
+    - npm test
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} .
+    - docker tag ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY}/${IMAGE_NAME}:latest
+    - docker push ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+    - docker push ${REGISTRY}/${IMAGE_NAME}:latest
+  after_script:
+    - echo "DEPLOY_TAG=${IMAGE_TAG}" > deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    paths:
+      - deploy.env
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client docker-compose
+    - mkdir -p ~/.ssh
+    - echo "${PROD_SSH_PRIVATE_KEY}" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H ${PROD_HOST} >> ~/.ssh/known_hosts
+  script:
+    - scp docker-compose.prod.yml ${PROD_USER}@${PROD_HOST}:${PROD_PATH}/docker-compose.prod.yml
+    - ssh ${PROD_USER}@${PROD_HOST}
+      "cd ${PROD_PATH} &&
+       export API_VERSION=${DEPLOY_TAG} &&
+       export DB_USER=${DB_USER} &&
+       export DB_PASSWORD=${DB_PASSWORD} &&
+       export DB_NAME=${DB_NAME} &&
+       docker compose -f docker-compose.prod.yml pull &&
+       docker compose -f docker-compose.prod.yml up -d"
+    - ssh ${PROD_USER}@${PROD_HOST}
+      "cd ${PROD_PATH} &&
+       docker compose -f docker-compose.prod.yml ps --format json |
+       jq -r '.[] | select(.Service==\"api\") | .Health' |
+       grep -q healthy"
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+rollback:
+  stage: deploy
+  when: manual
+  script:
+    - ssh ${PROD_USER}@${PROD_HOST}
+      "cd ${PROD_PATH} &&
+       export API_VERSION=${ROLLBACK_VERSION} &&
+       export DB_USER=${DB_USER} &&
+       export DB_PASSWORD=${DB_PASSWORD} &&
+       export DB_NAME=${DB_NAME} &&
+       docker compose -f docker-compose.prod.yml pull &&
+       docker compose -f docker-compose.prod.yml up -d"
+  environment:
+    name: production
+    action: rollback
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
